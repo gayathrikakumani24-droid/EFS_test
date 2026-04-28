@@ -1,0 +1,341 @@
+import streamlit as st
+import json
+import tempfile
+import os
+import re
+import networkx as nx
+from llama_parse import LlamaParse
+from groq import Groq
+
+
+# -------------------------------
+# 🔧 CONFIG
+# -------------------------------
+st.set_page_config(page_title="PUML Validator", layout="wide")
+
+GROQ_API_KEY=""
+LLAMA_PARSE_API_KEY=""
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+parser = LlamaParse(api_key=LLAMA_PARSE_API_KEY)
+
+# -------------------------------
+# 🧠 LLM Extraction (Groq)
+# -------------------------------
+def run_groq_json_extraction(prompt):
+    response = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
+
+    content = response.choices[0].message.content
+
+    try:
+        json_text = re.search(r"\[.*\]", content, re.S).group()
+        return json.loads(json_text)
+    except:
+        return {"error": content}
+
+
+def extract_puml_with_groq(text):
+    prompt = """
+Extract ONLY protocol-level transactional interactions into STRICT JSON format:
+[
+  {
+    "step": number,
+    "from": "entity",
+    "to": "entity",
+    "signal": "signal_name"
+  }
+]
+
+STRICT RULES:
+- Include ONLY signals that participate in VALID/READY handshake mechanisms
+- Include ONLY signals that define transaction flow (request, data, response)
+- EXCLUDE:
+  - Wakeup signals
+  - Interface control signals
+  - Static configuration signals
+  - QoS / coherency / sideband signals
+- Maintain correct causal sequence (VALID → READY pairs)
+- Output ONLY JSON
+- No explanation
+
+
+Text:
+"""
+    prompt = f"{prompt}{text}"
+    return run_groq_json_extraction(prompt)
+
+
+def extract_spec_with_groq(text):
+    prompt = """
+Extract ONLY high-level AXI protocol interactions into STRICT JSON format:
+
+[
+  {
+    "step": number,
+    "from": "entity",
+    "to": "entity",
+    "signal": "signal_name"
+  }
+]
+
+STRICT RULES:
+- Include ONLY VALID and READY signals that form handshake pairs
+- Ignore ALL other signals (data, control, QoS, MMU, wakeup, trace, loop, etc.)
+- Group signals into these protocol flows:
+  1. Write Address: AWVALID → AWREADY
+  2. Write Data: WVALID → WREADY
+  3. Write Response: BVALID → BREADY
+  4. Read Address: ARVALID → ARREADY
+  5. Read Data: RVALID → RREADY
+  6. Snoop Request: ACVALID → ACREADY
+  7. Snoop Response: CRVALID → CRREADY
+- Maintain this exact order of flows:
+  Write → Read → Snoop
+- Each VALID must come before its corresponding READY
+- Do NOT include duplicate or optional variations
+- Output ONLY JSON
+- No explanation
+Text:
+"""
+    prompt = f"{prompt}{text}"
+    return run_groq_json_extraction(prompt)
+
+# -------------------------------
+# 📄 Parse Spec File
+# -------------------------------
+def parse_spec(file):
+    file_extension = os.path.splitext(file.name)[1] or ".pdf"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
+        tmp.write(file.read())
+        tmp_path = tmp.name
+
+    docs = parser.load_data(tmp_path)
+    text = "\n".join([d.text for d in docs])
+    return text
+
+def parse_spec_json(file):
+    return json.loads(file.read().decode("utf-8"))
+
+# -------------------------------
+# 📊 Parse PUML File
+# -------------------------------
+def parse_puml(file):
+    return file.read().decode("utf-8")
+
+def validate_interaction_list(data):
+    if not isinstance(data, list):
+        raise ValueError("Expected top-level JSON array of interactions")
+
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"Item at index {idx} must be an object")
+
+        required_keys = ["from", "to", "signal"]
+        missing_keys = [k for k in required_keys if k not in item]
+        if missing_keys:
+            raise ValueError(
+                f"Item at index {idx} is missing required keys: {', '.join(missing_keys)}"
+            )
+
+    return data
+
+# -------------------------------
+# 🔄 Normalization
+# -------------------------------
+def normalize(data):
+    normalized = []
+    for i, item in enumerate(data):
+        normalized.append({
+            "step": item.get("step", i),
+            "from": item.get("from") or item.get("source"),
+            "to": item.get("to") or item.get("destination"),
+            "signal": item.get("signal") or item.get("label")
+        })
+    return sorted(normalized, key=lambda x: x["step"])
+
+# -------------------------------
+# 🧠 Semantic Compare
+# -------------------------------
+def semantic_compare(spec, gen):
+    missing = [s for s in spec if s not in gen]
+    extra = [g for g in gen if g not in spec]
+    score = 100 * (1 - (len(missing) + len(extra)) / max(len(spec), 1))
+    return missing, extra, score
+
+# -------------------------------
+# 📏 Rule Validation (AXI)
+# -------------------------------
+def rule_validation(data):
+    errors = []
+    signals = [d["signal"] for d in data]
+
+    rules = [
+        ("AWVALID", "AWREADY"),
+        ("WVALID", "WREADY"),
+        ("BVALID", "BREADY"),
+        ("ARVALID", "ARREADY"),
+        ("RVALID", "RREADY"),
+        ("ACVALID", "ACREADY"),
+        ("CRVALID", "CRREADY")
+    ]
+
+    for req, ack in rules:
+        if req in signals and ack not in signals:
+            errors.append(f"❌ Missing {ack} for {req}")
+
+    return errors
+
+# -------------------------------
+# 🧩 Graph Compare
+# -------------------------------
+def build_graph(data):
+    G = nx.DiGraph()
+    for d in data:
+        G.add_edge(d["from"], d["to"], label=d["signal"])
+    return G
+
+def graph_compare(spec, gen):
+    G1 = build_graph(spec)
+    G2 = build_graph(gen)
+
+    edges1 = set(G1.edges())
+    edges2 = set(G2.edges())
+
+    return edges1 - edges2, edges2 - edges1
+
+# -------------------------------
+# 🖥️ UI
+# -------------------------------
+st.title("🧩 PUML Validation System (Spec ↔ Diagram)")
+
+tab1, tab2 = st.tabs(["📄 Spec Upload", "📊 PUML Upload"])
+
+# -------------------------------
+# 📄 SPEC
+# -------------------------------
+with tab1:
+    st.header("📄 Upload Specification")
+
+    spec_file = st.file_uploader("Upload Spec", type=["pdf", "docx", "txt", "json"])
+
+    if spec_file:
+        spec_ext = os.path.splitext(spec_file.name)[1].lower()
+
+        if spec_ext == ".json":
+            try:
+                spec_json = parse_spec_json(spec_file)
+                spec_json = validate_interaction_list(spec_json)
+                st.session_state["spec_json"] = spec_json
+                st.success("Spec JSON uploaded and loaded successfully")
+                st.json(spec_json)
+            except Exception as e:
+                st.error(f"Invalid JSON file: {e}")
+        else:
+            st.info("Parsing spec...")
+            spec_text = parse_spec(spec_file)
+
+            st.text_area("Extracted Text", spec_text, height=200)
+
+            if st.button("Extract Spec JSON"):
+                spec_json = extract_spec_with_groq(spec_text)
+                if isinstance(spec_json, list):
+                    st.session_state["spec_json"] = spec_json
+                    st.json(spec_json)
+                else:
+                    st.error(f"Spec extraction failed: {spec_json}")
+
+# -------------------------------
+# 📊 PUML
+# -------------------------------
+with tab2:
+    st.header("📊 Upload PUML")
+
+    puml_file = st.file_uploader("Upload PUML", type=["puml", "txt"])
+
+    if puml_file:
+        puml_text = parse_puml(puml_file)
+
+        st.text_area("PUML Code", puml_text, height=200)
+
+        if st.button("Extract PUML JSON"):
+            puml_json = extract_puml_with_groq(puml_text)
+            st.json(puml_json)
+            st.session_state["puml_json"] = puml_json
+
+# -------------------------------
+# 🔄 Combined JSON
+# -------------------------------
+st.divider()
+st.header("🔄 Extracted JSON")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("Spec JSON")
+    st.json(st.session_state.get("spec_json", {}))
+
+with col2:
+    st.subheader("PUML JSON")
+    st.json(st.session_state.get("puml_json", {}))
+
+# -------------------------------
+# ✅ VALIDATION
+# -------------------------------
+st.divider()
+st.header("✅ Validation")
+
+if st.button("Run Validation"):
+
+    spec_json = st.session_state.get("spec_json", [])
+    puml_json = st.session_state.get("puml_json", [])
+
+    if not spec_json or not puml_json:
+        st.error("Upload and extract both inputs first!")
+    else:
+        spec_norm = normalize(spec_json)
+        puml_norm = normalize(puml_json)
+
+        # Semantic
+        st.subheader("🧠 Semantic Comparison")
+        missing, extra, score = semantic_compare(spec_norm, puml_norm)
+        st.write(f"Match Score: {score:.2f}%")
+
+        if missing:
+            st.error(f"Missing: {missing}")
+        if extra:
+            st.warning(f"Extra: {extra}")
+        if not missing and not extra:
+            st.success("Perfect match")
+
+        # Rules
+        st.subheader("📏 Rule Validation")
+        rule_errors = rule_validation(puml_norm)
+
+        if rule_errors:
+            for e in rule_errors:
+                st.error(e)
+        else:
+            st.success("All rules satisfied")
+
+        # Graph
+        st.subheader("🧩 Graph Comparison")
+        missing_edges, extra_edges = graph_compare(spec_norm, puml_norm)
+
+        if missing_edges:
+            st.error(f"Missing edges: {missing_edges}")
+        if extra_edges:
+            st.warning(f"Extra edges: {extra_edges}")
+        if not missing_edges and not extra_edges:
+            st.success("Graph matches")
+
+        # Final Verdict
+        st.subheader("🎯 Final Verdict")
+        if not missing and not extra and not rule_errors and not missing_edges:
+            st.success("🎉 VALIDATION SUCCESSFUL")
+        else:
+            st.error("❌ VALIDATION FAILED")
