@@ -1,1054 +1,1496 @@
-"""
-EFS Core Engine — Streamlit App
-Covers: Spec Intelligence → Protocol Intelligence → Flow Generator
-Uses LlamaParse (via dotenv) for document ingestion
-"""
-
 import os
-import json
 import re
+import json
+import zlib
 import tempfile
-import asyncio
-from pathlib import Path
-from dotenv import load_dotenv
 import streamlit as st
+from dotenv import load_dotenv
 
-# ── Load secrets ──────────────────────────────────────────────────────────────
+from llama_parse import LlamaParse
+from groq import Groq
+
 load_dotenv()
+
 LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
-OPENAI_API_KEY      = os.getenv("OPENAI_API_KEY")       # optional — used for LLM enrichment
-ANTHROPIC_API_KEY   = os.getenv("ANTHROPIC_API_KEY")    # optional — alternative LLM
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# ── Page config ───────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="EFS Core Engine",
-    page_icon="⚡",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+client = Groq(api_key=GROQ_API_KEY)
 
-# ── Global CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@300;400;600;700&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'Space Grotesk', sans-serif;
-}
-
-/* Dark industrial theme */
-.stApp { background: #0d0f14; color: #e2e8f0; }
-
-/* Sidebar */
-section[data-testid="stSidebar"] {
-    background: #111318 !important;
-    border-right: 1px solid #1e2330;
-}
-
-/* Stage cards */
-.stage-card {
-    background: linear-gradient(135deg, #13161f 0%, #1a1e2e 100%);
-    border: 1px solid #252a3d;
-    border-radius: 12px;
-    padding: 1.4rem 1.6rem;
-    margin-bottom: 1rem;
-    position: relative;
-    overflow: hidden;
-}
-.stage-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 3px;
-    background: var(--accent);
-}
-.stage-card.active::before { background: #38bdf8; }
-.stage-card.done::before   { background: #4ade80; }
-.stage-card.idle::before   { background: #334155; }
-
-.stage-title {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.78rem;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    margin-bottom: 0.4rem;
-}
-.stage-title.active { color: #38bdf8; }
-.stage-title.done   { color: #4ade80; }
-.stage-title.idle   { color: #475569; }
-
-.badge {
-    display: inline-block;
-    padding: 0.15rem 0.55rem;
-    border-radius: 999px;
-    font-size: 0.68rem;
-    font-weight: 600;
-    letter-spacing: 0.06em;
-}
-.badge-blue   { background: #1e3a5f; color: #7dd3fc; }
-.badge-green  { background: #14342b; color: #6ee7b7; }
-.badge-amber  { background: #3d2c0e; color: #fcd34d; }
-.badge-purple { background: #2d1f5e; color: #c4b5fd; }
-.badge-slate  { background: #1e293b; color: #94a3b8; }
-
-.signal-chip {
-    display: inline-block;
-    background: #1e293b;
-    border: 1px solid #334155;
-    border-radius: 6px;
-    padding: 0.2rem 0.6rem;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.75rem;
-    color: #cbd5e1;
-    margin: 2px;
-}
-
-.plantuml-block {
-    background: #0a0c10;
-    border: 1px solid #1e2330;
-    border-radius: 8px;
-    padding: 1rem 1.2rem;
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.78rem;
-    line-height: 1.7;
-    color: #a5f3fc;
-    overflow-x: auto;
-    white-space: pre;
-}
-
-.section-header {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 0.7rem;
-    font-weight: 600;
-    letter-spacing: 0.18em;
-    text-transform: uppercase;
-    color: #475569;
-    margin: 1.4rem 0 0.6rem 0;
-    padding-bottom: 0.3rem;
-    border-bottom: 1px solid #1e293b;
-}
-
-.metric-row {
-    display: flex; gap: 12px; flex-wrap: wrap; margin: 0.6rem 0;
-}
-.metric-box {
-    background: #13161f;
-    border: 1px solid #1e2330;
-    border-radius: 8px;
-    padding: 0.6rem 1rem;
-    text-align: center;
-    min-width: 80px;
-}
-.metric-box .val {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 1.4rem;
-    font-weight: 700;
-    color: #38bdf8;
-}
-.metric-box .lbl {
-    font-size: 0.65rem;
-    color: #64748b;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-}
-
-div[data-testid="stExpander"] > div:first-child {
-    background: #13161f !important;
-    border: 1px solid #1e2330 !important;
-    border-radius: 8px !important;
-}
-
-.stButton > button {
-    background: linear-gradient(135deg, #1d4ed8, #2563eb) !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 8px !important;
-    font-family: 'IBM Plex Mono', monospace !important;
-    font-size: 0.8rem !important;
-    font-weight: 600 !important;
-    letter-spacing: 0.06em !important;
-    padding: 0.55rem 1.4rem !important;
-    transition: all 0.2s !important;
-}
-.stButton > button:hover {
-    background: linear-gradient(135deg, #2563eb, #3b82f6) !important;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 16px rgba(59,130,246,0.35) !important;
-}
-
-.stFileUploader > div { background: #13161f !important; border: 1px dashed #334155 !important; border-radius: 10px !important; }
-
-hr { border-color: #1e2330 !important; }
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Spec Intelligence Prototype", layout="wide")
+st.title("Spec Intelligence — Document to Markdown + Protocol Detection")
+st.caption("Upload semiconductor/protocol specification documents")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# HELPER UTILITIES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def check_dependencies():
-    """Verify required packages are installed."""
-    missing = []
+# -----------------------------------------------------------------------
+# LLAMAPARSE
+# -----------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def parse_document(file_path):
+    if not LLAMA_CLOUD_API_KEY:
+        raise ValueError("LLAMA_CLOUD_API_KEY is not set")
+    st.write(f"🔑 Using LlamaParse API key: {LLAMA_CLOUD_API_KEY[:10]}...")
+    parser = LlamaParse(api_key=LLAMA_CLOUD_API_KEY, result_type="markdown", verbose=True)
     try:
-        import llama_parse  # noqa
-    except ImportError:
-        missing.append("llama-parse")
-    try:
-        from dotenv import load_dotenv  # noqa
-    except ImportError:
-        missing.append("python-dotenv")
-    return missing
+        docs = parser.load_data(file_path)
+        if not docs:
+            raise ValueError("No documents returned from LlamaParse")
+        markdown_text = "\n\n".join([d.text for d in docs])
+        if not markdown_text.strip():
+            raise ValueError("Empty markdown content extracted")
+        st.write(f"📝 Extracted {len(markdown_text)} characters of markdown")
+        return markdown_text
+    except Exception as e:
+        st.error(f"LlamaParse error: {str(e)}")
+        raise e
 
 
-def parse_document_with_llamaparse(file_bytes: bytes, filename: str) -> str:
-    """
-    Use LlamaParse to extract structured markdown from a PDF/DOCX.
-    Returns the concatenated markdown string.
-    """
-    from llama_parse import LlamaParse
+# -----------------------------------------------------------------------
+# PROTOCOL DETECTOR
+# -----------------------------------------------------------------------
+def detect_protocol(markdown_text):
+    snippet = markdown_text[:12000]
+    prompt = f"""
+You are an expert semiconductor protocol analyst.
+Analyze this specification content and identify the protocol type:
+AXI, PCIe, CXL, CHI, AMBA, USB, Ethernet, Proprietary, or Unknown.
 
-    parser = LlamaParse(
-        api_key=LLAMA_CLOUD_API_KEY,
-        result_type="markdown",
-        verbose=False,
-        language="en",
-        parsing_instruction=(
-            "Extract all text including tables, figures captions, section headings, "
-            "register maps, signal names, protocol conditions, and timing rules. "
-            "Preserve hierarchy with markdown headings."
-        ),
-    )
+Return JSON:
+{{"protocol":"","confidence":"","signals_found":[],"reasoning":""}}
 
-    suffix = Path(filename).suffix or ".pdf"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
-
-    try:
-        documents = parser.load_data(tmp_path)
-        combined = "\n\n".join(doc.text for doc in documents)
-        return combined
-    finally:
-        os.unlink(tmp_path)
-
-
-# ── Spec Intelligence helpers ──────────────────────────────────────────────────
-
-SECTION_RE = re.compile(r'^(#{1,4})\s+(.+)', re.MULTILINE)
-SIGNAL_RE  = re.compile(
-    r'\b([A-Z][A-Z0-9_]{2,}(?:VALID|READY|DATA|ADDR|EN|SEL|REQ|ACK|CLK|RST|WE|RE|STRB|RESP|PROT|ID|LEN|SIZE|BURST|LOCK|CACHE|QOS|REGION|USER|LAST)?)\b'
-)
-CONDITION_RE = re.compile(
-    r'[Ii]f\s+(.{10,120}?)(?:,|\.|then|is|are|assert)', re.DOTALL
-)
-REGISTER_RE = re.compile(
-    r'\b([A-Z][A-Z0-9_]*(?:_REG|_CTRL|_STATUS|_CFG|_ADDR|_DATA|_BASE|_OFFSET)?)\b'
-)
-
-PROTOCOL_KEYWORDS = {
-    "AXI":   ["ARVALID","ARREADY","AWVALID","AWREADY","WVALID","WREADY",
-               "RVALID","RREADY","BVALID","BREADY","ARID","AWID","WID","RID","BID"],
-    "PCIe":  ["TLP","DLLP","completion","requester","completer","BAR","MRd","MWr",
-               "CplD","FC","LTSSM","L0s","L1"],
-    "CXL":   ["CXL.io","CXL.cache","CXL.mem","HDM","DVSEC","DOE","snoop","bias"],
-    "CHI":   ["REQ","RSP","DAT","SNP","flit","link layer","transaction layer",
-               "home node","request node","slave node"],
-    "AHB":   ["HADDR","HTRANS","HSIZE","HBURST","HPROT","HWDATA","HRDATA",
-               "HREADY","HRESP","HMASTER","HSEL"],
-    "APB":   ["PADDR","PSEL","PENABLE","PWRITE","PWDATA","PRDATA","PREADY","PSLVERR"],
-}
-
-
-def run_spec_intelligence(markdown_text: str) -> dict:
-    """
-    Parse markdown from LlamaParse into structured spec model.
-    Returns dict with sections, signals, conditions, registers, summary stats.
-    """
-    sections = []
-    for m in SECTION_RE.finditer(markdown_text):
-        level = len(m.group(1))
-        title = m.group(2).strip()
-        # classify normative vs informative
-        normative = any(kw in title.lower() for kw in
-                        ["shall","must","requirement","mandatory","compliance"])
-        sections.append({"level": level, "title": title, "normative": normative})
-
-    # Signal extraction (deduplicated, sorted)
-    raw_signals = SIGNAL_RE.findall(markdown_text)
-    signals = sorted(set(s for s in raw_signals if len(s) >= 4))
-
-    # Condition extraction
-    conditions = []
-    for m in CONDITION_RE.finditer(markdown_text):
-        cond_text = m.group(1).strip().replace("\n", " ")
-        if len(cond_text) > 10:
-            # Naive normalization
-            normalized = cond_text
-            normalized = re.sub(r'is asserted|is high|== 1|= 1', '== 1', normalized)
-            normalized = re.sub(r'is deasserted|is low|== 0|= 0', '== 0', normalized)
-            conditions.append({
-                "raw": cond_text[:120],
-                "normalized": normalized[:120],
-            })
-    conditions = conditions[:30]  # cap
-
-    # Register extraction
-    raw_regs = REGISTER_RE.findall(markdown_text)
-    registers = sorted(set(r for r in raw_regs
-                           if len(r) >= 5
-                           and any(suffix in r for suffix in
-                                   ["_REG","_CTRL","_STATUS","_CFG","_ADDR",
-                                    "_DATA","_BASE","_OFFSET"])))
-
-    return {
-        "sections": sections,
-        "signals": signals[:60],
-        "conditions": conditions,
-        "registers": registers[:30],
-        "word_count": len(markdown_text.split()),
-        "char_count": len(markdown_text),
-    }
-
-
-def run_protocol_intelligence(spec_model: dict, markdown_text: str) -> dict:
-    """
-    Classify protocol, map transactions, assign actor roles.
-    Returns protocol dict.
-    """
-    signals_set = set(spec_model["signals"])
-    text_upper  = markdown_text.upper()
-
-    # Score each protocol
-    scores = {}
-    for proto, keywords in PROTOCOL_KEYWORDS.items():
-        hit = sum(1 for kw in keywords if kw.upper() in text_upper)
-        scores[proto] = hit
-
-    detected = [p for p, s in sorted(scores.items(), key=lambda x: -x[1]) if s > 0]
-    primary  = detected[0] if detected else "UNKNOWN"
-
-    # Transaction templates per protocol
-    TRANSACTION_TEMPLATES = {
-        "AXI": {
-            "Read":  ["AR channel: ARVALID/ARREADY handshake",
-                      "R channel: RVALID/RREADY data transfer",
-                      "RLAST asserted on final beat"],
-            "Write": ["AW channel: AWVALID/AWREADY handshake",
-                      "W channel: WVALID/WREADY data + WSTRB",
-                      "WLAST on final beat",
-                      "B channel: BVALID/BREADY response"],
-        },
-        "PCIe": {
-            "Memory Read":  ["Requester sends MRd TLP","Completer returns CplD TLP","FC credits updated"],
-            "Memory Write": ["Requester sends MWr TLP","Posted — no completion required","FC credits updated"],
-        },
-        "CXL": {
-            "CXL.mem Read":  ["Host sends MemRd","Device returns MemData","HDM decode"],
-            "CXL.cache Snoop": ["Home sends SNP","Device responds SnpResp","Cache state transition"],
-        },
-        "AHB": {
-            "Transfer": ["Master drives HTRANS/HADDR","Slave samples on HCLK","HREADY extended wait","HRDATA driven"],
-        },
-        "APB": {
-            "Write": ["PSEL asserted","PENABLE low → high","PWRITE + PWDATA stable","PREADY"],
-            "Read":  ["PSEL asserted","PENABLE low → high","PWRITE low","PRDATA captured"],
-        },
-    }
-
-    transactions = TRANSACTION_TEMPLATES.get(primary, {
-        "Generic Transaction": ["Request issued","Acknowledge received","Data exchanged","Response returned"]
-    })
-
-    # Actor-role assignment
-    actor_roles = {
-        "AXI":  {"Manager": "AXI Master (initiates AR/AW)", "Subordinate": "AXI Slave (responds R/B)"},
-        "PCIe": {"Requester": "PCIe Root/EP (sends TLP)", "Completer": "Target EP/RC (returns Cpl)"},
-        "CXL":  {"Host": "CPU Complex", "Device": "CXL Device (Type 1/2/3)"},
-        "CHI":  {"Request Node": "CPU / DMA", "Home Node": "Interconnect", "Slave Node": "Memory"},
-        "AHB":  {"Master": "Bus Master (DMA/CPU)", "Slave": "Peripheral/Memory"},
-        "APB":  {"Master": "APB Bridge", "Slave": "APB Peripheral"},
-    }.get(primary, {"Initiator": "Source component", "Target": "Destination component"})
-
-    # Handshake rules
-    handshake_rules = {
-        "AXI":  ["VALID may not depend on READY","READY may depend on VALID",
-                 "Handshake completes when both VALID and READY are HIGH on rising edge"],
-        "PCIe": ["Ordering rules: Posted > Non-Posted > Completion",
-                 "Flow control credits must be available before TLP transmission"],
-        "AHB":  ["Transfer starts when HTRANS != IDLE","Slave extends by deasserting HREADY"],
-        "APB":  ["Two-phase: SETUP then ENABLE","PSEL must remain asserted throughout"],
-    }.get(primary, ["Request acknowledged before data transfer",
-                     "Response must match outstanding transaction ID"])
-
-    return {
-        "primary_protocol": primary,
-        "detected_protocols": detected,
-        "scores": scores,
-        "transactions": transactions,
-        "actor_roles": actor_roles,
-        "handshake_rules": handshake_rules,
-    }
-
-
-def run_flow_generator(spec_model: dict, proto_model: dict) -> dict:
-    """
-    Generate PlantUML sequence + state diagrams from protocol model.
-    """
-    primary  = proto_model["primary_protocol"]
-    actors   = proto_model["actor_roles"]
-    txns     = proto_model["transactions"]
-
-    actor_names = list(actors.keys())
-    a1 = actor_names[0] if len(actor_names) > 0 else "Initiator"
-    a2 = actor_names[1] if len(actor_names) > 1 else "Target"
-
-    # ── Sequence diagram ──────────────────────────────────────────────────────
-    seq_lines = ["@startuml", "skinparam monochrome true",
-                 "skinparam sequenceMessageAlign center",
-                 f'participant "{a1}" as A',
-                 f'participant "{a2}" as B', ""]
-
-    for txn_name, steps in txns.items():
-        seq_lines.append(f"== {txn_name} ==")
-        for i, step in enumerate(steps):
-            if "→" in step or "return" in step.lower() or "response" in step.lower() or "data" in step.lower():
-                seq_lines.append(f'B --> A: {step}')
-            elif i % 2 == 0:
-                seq_lines.append(f'A -> B: {step}')
-            else:
-                seq_lines.append(f'B -> A: {step}')
-        seq_lines.append("")
-
-    seq_lines.append("@enduml")
-    sequence_uml = "\n".join(seq_lines)
-
-    # ── State diagram ─────────────────────────────────────────────────────────
-    STATE_MACHINES = {
-        "AXI": {
-            "states": ["IDLE","AR_PENDING","R_TRANSFER","AW_PENDING",
-                       "W_TRANSFER","B_PENDING"],
-            "transitions": [
-                ("IDLE","AR_PENDING","ARVALID"),
-                ("AR_PENDING","R_TRANSFER","ARREADY"),
-                ("R_TRANSFER","IDLE","RLAST && RREADY"),
-                ("IDLE","AW_PENDING","AWVALID"),
-                ("AW_PENDING","W_TRANSFER","AWREADY"),
-                ("W_TRANSFER","B_PENDING","WLAST && WREADY"),
-                ("B_PENDING","IDLE","BREADY"),
-            ]
-        },
-        "PCIe": {
-            "states": ["IDLE","TLP_BUILD","TLP_SEND","AWAIT_CPL","CPL_RECV","ERROR"],
-            "transitions": [
-                ("IDLE","TLP_BUILD","request_issued"),
-                ("TLP_BUILD","TLP_SEND","FC_credits_ok"),
-                ("TLP_SEND","AWAIT_CPL","MRd sent"),
-                ("AWAIT_CPL","CPL_RECV","CplD received"),
-                ("CPL_RECV","IDLE","transfer_done"),
-                ("AWAIT_CPL","ERROR","timeout"),
-                ("ERROR","IDLE","recovery"),
-            ]
-        },
-        "APB": {
-            "states": ["IDLE","SETUP","ENABLE","DONE"],
-            "transitions": [
-                ("IDLE","SETUP","PSEL"),
-                ("SETUP","ENABLE","PENABLE"),
-                ("ENABLE","DONE","PREADY"),
-                ("DONE","IDLE","xfer_complete"),
-            ]
-        },
-    }
-
-    sm = STATE_MACHINES.get(primary, {
-        "states": ["IDLE","REQUEST","TRANSFER","RESPONSE","DONE"],
-        "transitions": [
-            ("IDLE","REQUEST","req_valid"),
-            ("REQUEST","TRANSFER","req_ack"),
-            ("TRANSFER","RESPONSE","data_done"),
-            ("RESPONSE","DONE","resp_ok"),
-            ("DONE","IDLE","reset"),
-        ]
-    })
-
-    fsm_lines = ["@startuml", "skinparam monochrome true",
-                 "[*] --> IDLE", ""]
-    for (src, dst, label) in sm["transitions"]:
-        fsm_lines.append(f'{src} --> {dst} : {label}')
-    fsm_lines += ["", "@enduml"]
-    state_uml = "\n".join(fsm_lines)
-
-    # ── Condition logic ───────────────────────────────────────────────────────
-    conditions = spec_model.get("conditions", [])
-    logic_table = []
-    for c in conditions[:10]:
-        logic_table.append({
-            "condition": c["raw"][:80],
-            "normalized": c["normalized"][:80],
-        })
-
-    return {
-        "sequence_uml": sequence_uml,
-        "state_uml":    state_uml,
-        "transactions":  list(txns.keys()),
-        "fsm_states":    sm["states"],
-        "logic_table":   logic_table,
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ═══════════════════════════════════════════════════════════════════════════════
-
-with st.sidebar:
-    st.markdown("""
-    <div style='padding:0.6rem 0 1rem 0'>
-        <div style='font-family:IBM Plex Mono,monospace;font-size:0.65rem;
-                    letter-spacing:0.2em;color:#475569;text-transform:uppercase'>
-            EFS Platform
-        </div>
-        <div style='font-size:1.4rem;font-weight:700;color:#e2e8f0;
-                    line-height:1.2;margin-top:4px'>
-            Core Engine<br>
-            <span style='color:#38bdf8'>Spec → Flow</span>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    st.markdown("""
-    <div class='section-header'>Pipeline Stages</div>
-    """, unsafe_allow_html=True)
-
-    # Dynamic stage status from session_state
-    stage_status = {
-        "01 Spec Intelligence":    st.session_state.get("spec_done", False),
-        "02 Protocol Intelligence":st.session_state.get("proto_done", False),
-        "03 Flow Generator":       st.session_state.get("flow_done", False),
-    }
-    for name, done in stage_status.items():
-        status_cls = "done" if done else "idle"
-        icon = "✓" if done else "○"
-        color = "#4ade80" if done else "#334155"
-        st.markdown(f"""
-        <div style='display:flex;align-items:center;gap:8px;
-                    padding:0.35rem 0;color:{color};
-                    font-family:IBM Plex Mono,monospace;font-size:0.75rem'>
-            <span>{icon}</span><span>{name}</span>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-    st.markdown('<div class="section-header">Configuration</div>', unsafe_allow_html=True)
-
-    api_key_input = st.text_input(
-        "LlamaCloud API Key",
-        value=LLAMA_CLOUD_API_KEY or "",
-        type="password",
-        help="Set LLAMA_CLOUD_API_KEY in .env or enter here",
-    )
-    if api_key_input:
-        LLAMA_CLOUD_API_KEY = api_key_input
-
-    result_type = st.selectbox("LlamaParse Output", ["markdown", "text"], index=0)
-
-    st.markdown("---")
-    missing = check_dependencies()
-    if missing:
-        st.warning(f"Missing packages: `{', '.join(missing)}`\n\n"
-                   f"Install: `pip install {' '.join(missing)}`")
-    else:
-        st.success("All dependencies installed ✓")
-
-    with st.expander("Install commands"):
-        st.code("pip install llama-parse python-dotenv streamlit", language="bash")
-        st.code("""# .env file
-LLAMA_CLOUD_API_KEY=llx-...
-OPENAI_API_KEY=sk-...      # optional
-ANTHROPIC_API_KEY=sk-ant-... # optional
-""", language="bash")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN CONTENT
-# ═══════════════════════════════════════════════════════════════════════════════
-
-st.markdown("""
-<div style='margin-bottom:1.6rem'>
-    <div style='font-family:IBM Plex Mono,monospace;font-size:0.65rem;
-                letter-spacing:0.2em;color:#475569;text-transform:uppercase;
-                margin-bottom:4px'>Electronic Function Specification</div>
-    <h1 style='margin:0;font-size:2rem;font-weight:700;color:#e2e8f0'>
-        EFS Core Engine
-        <span style='color:#38bdf8;font-size:1.1rem;font-weight:400;
-                     margin-left:12px;font-family:IBM Plex Mono,monospace'>
-            v1.0
-        </span>
-    </h1>
-    <p style='color:#64748b;margin:4px 0 0 0;font-size:0.9rem'>
-        Spec Intelligence · Protocol Intelligence · Flow Generator
-    </p>
-</div>
-""", unsafe_allow_html=True)
-
-# ── Upload zone ───────────────────────────────────────────────────────────────
-st.markdown('<div class="section-header">Document Ingestion via LlamaParse</div>',
-            unsafe_allow_html=True)
-
-uploaded = st.file_uploader(
-    "Upload specification (PDF or DOCX)",
-    type=["pdf", "docx"],
-    help="LlamaParse will extract structured markdown for all three pipeline stages.",
-)
-
-demo_mode = st.checkbox(
-    "Use built-in demo (AXI4 snippet — no API key needed)",
-    value=not bool(LLAMA_CLOUD_API_KEY),
-)
-
-DEMO_MARKDOWN = """
-# AXI4 Full Interconnect Protocol Specification
-
-## 1. Introduction
-This document specifies the AXI4 (Advanced eXtensible Interface 4) protocol requirements
-for all IP cores in the SoC interconnect fabric.
-
-## 2. Normative Signal Definitions
-The following signals are mandatory for all AXI4-compliant interfaces:
-
-| Signal     | Direction | Width | Description            |
-|------------|-----------|-------|------------------------|
-| ARVALID    | Master→Slave | 1  | Read address valid     |
-| ARREADY    | Slave→Master | 1  | Read address ready     |
-| ARADDR     | Master→Slave | 32 | Read address           |
-| ARID       | Master→Slave | 4  | Read transaction ID    |
-| AWVALID    | Master→Slave | 1  | Write address valid    |
-| AWREADY    | Slave→Master | 1  | Write address ready    |
-| WVALID     | Master→Slave | 1  | Write data valid       |
-| WREADY     | Slave→Master | 1  | Write data ready       |
-| WSTRB      | Master→Slave | 4  | Write byte strobe      |
-| WLAST      | Master→Slave | 1  | Write last beat        |
-| RVALID     | Slave→Master | 1  | Read data valid        |
-| RREADY     | Master→Slave | 1  | Read data ready        |
-| BVALID     | Slave→Master | 1  | Write response valid   |
-| BREADY     | Master→Slave | 1  | Write response ready   |
-| BRESP      | Slave→Master | 2  | Write response code    |
-
-## 3. Handshake Rules — Shall Requirements
-3.1 A source shall not make VALID dependent on the corresponding READY signal.
-3.2 If ARVALID is asserted and ARREADY is high, the read address phase completes.
-3.3 If AWVALID is asserted and AWREADY is high, the write address phase completes.
-3.4 WLAST shall be asserted on the final data beat of a burst.
-3.5 The master shall not change ARADDR while ARVALID is asserted.
-
-## 4. Ordering Rules
-4.1 Transactions with the same ID shall complete in order.
-4.2 The slave shall return RDATA in the order read addresses were received.
-
-## 5. Register Map (AXI Slave Control Registers)
-| Offset | Name         | Width | Access | Description          |
-|--------|--------------|-------|--------|----------------------|
-| 0x00   | CTRL_REG     | 32    | RW     | Control register     |
-| 0x04   | STATUS_REG   | 32    | RO     | Status register      |
-| 0x08   | ADDR_BASE    | 32    | RW     | Base address         |
-| 0x0C   | CFG_REG      | 32    | RW     | Configuration        |
-| 0x10   | DATA_REG     | 32    | RW     | Data register        |
+Specification:
+{snippet}
 """
+    completion = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return json.loads(completion.choices[0].message.content)
 
-run_btn = st.button("▶  Run EFS Pipeline", use_container_width=False)
 
-if run_btn:
-    # ── Validate ──────────────────────────────────────────────────────────────
-    if not demo_mode and not uploaded:
-        st.error("Please upload a document or enable demo mode.")
-        st.stop()
-    if not demo_mode and not LLAMA_CLOUD_API_KEY:
-        st.error("LlamaCloud API key is required. Set LLAMA_CLOUD_API_KEY in .env or the sidebar.")
-        st.stop()
+# -----------------------------------------------------------------------
+# SEMANTIC JSON EXTRACTION
+# -----------------------------------------------------------------------
+def extract_semantic_json(markdown_text, extraction_mode="basic", chunk_size=8000):
+    st.write("🧠 Starting semantic extraction...")
+    if not markdown_text or not markdown_text.strip():
+        st.error("❌ No markdown content to process")
+        return None
 
-    # ── Stage 1: LlamaParse ingestion ─────────────────────────────────────────
-    with st.status("🔍 Stage 1 — LlamaParse Document Ingestion", expanded=True) as status1:
-        st.write("Parsing document with LlamaParse…")
+    semantic_json = {
+        "document_metadata": {"document_name": "extracted_spec", "protocol": "unknown", "sections_detected": 0},
+        "signals": [], "registers": [], "transactions": [], "constraints": [], "timing_conditions": []
+    }
+
+    if len(markdown_text) > chunk_size:
+        chunks = [markdown_text[i:i + chunk_size] for i in range(0, len(markdown_text), chunk_size)]
+        st.write(f"🔢 Processing {len(chunks)} chunks...")
+    else:
+        chunks = [markdown_text]
+
+    for i, chunk in enumerate(chunks):
+        st.write(f"🔄 Processing chunk {i + 1}/{len(chunks)}...")
         try:
-            if demo_mode:
-                markdown_text = DEMO_MARKDOWN
-                st.write("✓ Demo markdown loaded (AXI4 spec snippet)")
-            else:
-                file_bytes = uploaded.read()
-                st.write(f"File size: {len(file_bytes):,} bytes — uploading to LlamaParse…")
-                markdown_text = parse_document_with_llamaparse(file_bytes, uploaded.name)
-                st.write(f"✓ LlamaParse returned {len(markdown_text):,} characters")
-            st.session_state["markdown_text"] = markdown_text
-            status1.update(label="✓ Document ingested", state="complete")
+            chunk_result = _extract_from_chunk(chunk, extraction_mode)
+            if chunk_result:
+                for key in ["signals", "registers", "transactions", "constraints", "timing_conditions"]:
+                    semantic_json[key].extend(chunk_result.get(key, []))
+                if chunk_result.get("document_metadata", {}).get("protocol", "unknown") != "unknown":
+                    semantic_json["document_metadata"]["protocol"] = chunk_result["document_metadata"]["protocol"]
         except Exception as e:
-            status1.update(label="✗ Ingestion failed", state="error")
-            st.error(f"LlamaParse error: {e}")
-            st.stop()
+            st.error(f"❌ Error processing chunk {i + 1}: {str(e)}")
+            continue
 
-    # ── Stage 2: Spec Intelligence ────────────────────────────────────────────
-    with st.status("🧠 Stage 2 — Spec Intelligence", expanded=True) as status2:
-        st.write("Extracting signals, conditions, registers, sections…")
-        spec_model = run_spec_intelligence(markdown_text)
-        st.session_state["spec_model"] = spec_model
-        st.session_state["spec_done"]  = True
-        st.write(f"✓ {len(spec_model['sections'])} sections  "
-                 f"| {len(spec_model['signals'])} signals  "
-                 f"| {len(spec_model['conditions'])} conditions  "
-                 f"| {len(spec_model['registers'])} registers")
-        status2.update(label="✓ Spec Intelligence complete", state="complete")
-
-    # ── Stage 3: Protocol Intelligence ───────────────────────────────────────
-    with st.status("⚙️ Stage 3 — Protocol Intelligence", expanded=True) as status3:
-        st.write("Classifying protocol, mapping transactions, assigning roles…")
-        proto_model = run_protocol_intelligence(spec_model, markdown_text)
-        st.session_state["proto_model"] = proto_model
-        st.session_state["proto_done"]  = True
-        st.write(f"✓ Primary protocol: {proto_model['primary_protocol']}  "
-                 f"| {len(proto_model['transactions'])} transaction types")
-        status3.update(label="✓ Protocol Intelligence complete", state="complete")
-
-    # ── Stage 4: Flow Generator ────────────────────────────────────────────────
-    with st.status("🔁 Stage 4 — Flow Generator", expanded=True) as status4:
-        st.write("Generating PlantUML sequence & state diagrams…")
-        flow_model = run_flow_generator(spec_model, proto_model)
-        st.session_state["flow_model"] = flow_model
-        st.session_state["flow_done"]  = True
-        st.write(f"✓ {len(flow_model['transactions'])} flows  "
-                 f"| {len(flow_model['fsm_states'])} FSM states  "
-                 f"| {len(flow_model['logic_table'])} condition rules")
-        status4.update(label="✓ Flow Generator complete", state="complete")
-
-    st.success("🎉 EFS Pipeline complete — all three stages finished successfully.")
-    st.rerun()
+    semantic_json["document_metadata"]["sections_detected"] = len(chunks)
+    semantic_json = _remove_duplicates(semantic_json)
+    st.write(
+        f"✅ Done: {len(semantic_json['signals'])} signals, "
+        f"{len(semantic_json['transactions'])} transactions, "
+        f"{len(semantic_json['constraints'])} constraints"
+    )
+    return semantic_json
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# RESULTS DISPLAY
-# ═══════════════════════════════════════════════════════════════════════════════
+def _extract_from_chunk(chunk_text, extraction_mode):
+    prompt = f"""
+You are a semiconductor specification semantic extraction engine.
+Convert this specification content into structured engineering JSON.
 
-if st.session_state.get("spec_done"):
-    spec_model  = st.session_state["spec_model"]
-    proto_model = st.session_state.get("proto_model", {})
-    flow_model  = st.session_state.get("flow_model", {})
-    markdown_text = st.session_state.get("markdown_text", "")
+Extract:
+- signals (name, direction: input/output/inout/master/slave, description, section_ref)
+- registers (name, fields array)
+- transactions (name, actors array, sequence_steps array)
+- constraints (rule, type, condition, section_ref) - look for MUST/SHALL/REQUIRED/SHOULD/MAY
+- timing_conditions (trigger, response)
 
-    st.markdown("---")
+Return ONLY valid JSON:
+{{
+  "document_metadata": {{"document_name":"","protocol":"","sections_detected":0}},
+  "signals":[{{"name":"","direction":"","description":"","section_ref":""}}],
+  "registers":[{{"name":"","fields":[]}}],
+  "transactions":[{{"name":"","actors":[],"sequence_steps":[]}}],
+  "constraints":[{{"rule":"","type":"","condition":"","section_ref":""}}],
+  "timing_conditions":[{{"trigger":"","response":""}}]
+}}
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "🧠 Spec Intelligence",
-        "⚙️ Protocol Intelligence",
-        "🔁 Flow Generator",
-        "📄 Raw Markdown",
-    ])
+Specification content:
+{chunk_text}
+"""
+    completion = client.chat.completions.create(
+        model="llama-3.1-8b-instant",
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[{"role": "user", "content": prompt}]
+    )
+    try:
+        return json.loads(completion.choices[0].message.content)
+    except json.JSONDecodeError:
+        return None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # TAB 1 — Spec Intelligence
-    # ──────────────────────────────────────────────────────────────────────────
-    with tab1:
-        st.markdown('<div class="stage-card done">'
-                    '<div class="stage-title done">STAGE 01 — SPEC INTELLIGENCE</div>'
-                    '<span class="badge badge-green">COMPLETE</span>'
-                    '</div>', unsafe_allow_html=True)
 
-        # Metrics row
-        st.markdown(f"""
-        <div class="metric-row">
-            <div class="metric-box"><div class="val">{len(spec_model['sections'])}</div><div class="lbl">Sections</div></div>
-            <div class="metric-box"><div class="val">{len(spec_model['signals'])}</div><div class="lbl">Signals</div></div>
-            <div class="metric-box"><div class="val">{len(spec_model['conditions'])}</div><div class="lbl">Conditions</div></div>
-            <div class="metric-box"><div class="val">{len(spec_model['registers'])}</div><div class="lbl">Registers</div></div>
-            <div class="metric-box"><div class="val">{spec_model['word_count']:,}</div><div class="lbl">Words</div></div>
-        </div>
-        """, unsafe_allow_html=True)
+def _remove_duplicates(sj):
+    for category in ["signals", "registers", "transactions", "constraints", "timing_conditions"]:
+        seen, unique = set(), []
+        for item in sj[category]:
+            if category in ("signals", "registers", "transactions"):
+                key = item.get("name", "")
+            elif category == "constraints":
+                key = f"{item.get('rule','')}_{item.get('condition','')}"
+            else:
+                key = f"{item.get('trigger','')}_{item.get('response','')}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        sj[category] = unique
+    return sj
 
-        col_a, col_b = st.columns(2)
 
-        with col_a:
-            # Section hierarchy
-            st.markdown('<div class="section-header">Section Hierarchy</div>',
-                        unsafe_allow_html=True)
-            for sec in spec_model["sections"][:25]:
-                indent = "&nbsp;" * ((sec["level"] - 1) * 4)
-                badge  = '<span class="badge badge-amber">NORMATIVE</span>' \
-                         if sec["normative"] else ''
-                st.markdown(
-                    f'<div style="font-size:0.82rem;color:#cbd5e1;'
-                    f'padding:3px 0;border-left:2px solid #1e2330;padding-left:8px">'
-                    f'{indent}<span style="color:#64748b">{"#"*sec["level"]}</span> '
-                    f'{sec["title"]} {badge}</div>',
-                    unsafe_allow_html=True
-                )
+# -----------------------------------------------------------------------
+# PLANTUML ENCODING + RENDERING
+# -----------------------------------------------------------------------
+def _plantuml_encode(puml_text: str) -> str:
+    ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_"
 
-            # Registers
-            if spec_model["registers"]:
-                st.markdown('<div class="section-header">Register Map Fragments</div>',
-                            unsafe_allow_html=True)
-                reg_html = "".join(
-                    f'<span class="signal-chip">{r}</span>'
-                    for r in spec_model["registers"]
-                )
-                st.markdown(reg_html, unsafe_allow_html=True)
+    def enc6(b):
+        return ALPHABET[b & 0x3F]
 
-        with col_b:
-            # Signals
-            st.markdown('<div class="section-header">Signal Catalog</div>',
-                        unsafe_allow_html=True)
-            sig_html = "".join(
-                f'<span class="signal-chip">{s}</span>'
-                for s in spec_model["signals"]
-            )
-            st.markdown(sig_html, unsafe_allow_html=True)
+    def enc3(b1, b2, b3):
+        return (enc6(b1 >> 2) +
+                enc6(((b1 & 3) << 4) | (b2 >> 4)) +
+                enc6(((b2 & 0xF) << 2) | (b3 >> 6)) +
+                enc6(b3 & 0x3F))
 
-            # Conditions
-            if spec_model["conditions"]:
-                st.markdown('<div class="section-header">Condition Rules (Normalized)</div>',
-                            unsafe_allow_html=True)
-                for i, c in enumerate(spec_model["conditions"][:8]):
-                    st.markdown(
-                        f'<div style="margin-bottom:8px;padding:8px 10px;'
-                        f'background:#0d1117;border-radius:6px;'
-                        f'border-left:3px solid #1d4ed8">'
-                        f'<div style="font-size:0.7rem;color:#64748b;margin-bottom:2px">Raw:</div>'
-                        f'<div style="font-size:0.78rem;color:#cbd5e1">{c["raw"]}</div>'
-                        f'<div style="font-size:0.7rem;color:#64748b;margin-top:4px">Normalized:</div>'
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:0.75rem;color:#7dd3fc">'
-                        f'{c["normalized"]}</div></div>',
-                        unsafe_allow_html=True
-                    )
+    compress_obj = zlib.compressobj(9, zlib.DEFLATED, -15)
+    raw = compress_obj.compress(puml_text.encode("utf-8")) + compress_obj.flush()
 
-        # Full JSON export
-        with st.expander("Export: Spec Model JSON"):
-            st.json(spec_model)
+    result, i = "", 0
+    while i < len(raw):
+        b1 = raw[i]
+        b2 = raw[i + 1] if i + 1 < len(raw) else 0
+        b3 = raw[i + 2] if i + 2 < len(raw) else 0
+        result += enc3(b1, b2, b3)
+        i += 3
+    return result
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # TAB 2 — Protocol Intelligence
-    # ──────────────────────────────────────────────────────────────────────────
-    with tab2:
-        if not proto_model:
-            st.info("Run the pipeline to see Protocol Intelligence results.")
+
+def _puml_url(puml_text: str) -> str:
+    return f"https://www.plantuml.com/plantuml/svg/{_plantuml_encode(puml_text)}"
+
+
+def _render_plantuml(puml_code: str, height: int = 650):
+    import streamlit.components.v1 as components
+    svg_url = _puml_url(puml_code)
+    html = f"""<!DOCTYPE html><html><head><style>
+    body{{margin:0;padding:12px;background:#0f1117;display:flex;justify-content:center;}}
+    .wrap{{background:white;border-radius:12px;padding:20px;
+           box-shadow:0 0 40px rgba(99,179,237,0.10);max-width:100%;overflow:auto;text-align:center;}}
+    img{{max-width:100%;height:auto;border-radius:6px;}}
+    .err{{color:#fc8181;font-family:monospace;font-size:13px;padding:12px;}}
+    </style></head><body>
+    <div class="wrap">
+      <img src="{svg_url}" alt="PlantUML Diagram"
+           onerror="this.style.display='none';document.getElementById('e').style.display='block'"/>
+      <div id="e" class="err" style="display:none">
+        ⚠️ Could not render — check internet or inspect PlantUML source tab.
+      </div>
+    </div></body></html>"""
+    components.html(html, height=height, scrolling=True)
+
+
+def _puml_download(label: str, code: str, filename: str):
+    st.download_button(label=label, data=code, file_name=filename, mime="text/plain")
+
+
+# -----------------------------------------------------------------------
+# SAFE LABEL HELPERS
+# -----------------------------------------------------------------------
+def _safe(text: str, maxlen: int = 40) -> str:
+    t = str(text).encode("ascii", "ignore").decode("ascii")
+    t = re.sub(r'[\"\'`<>{}|\\]', "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:maxlen]
+
+
+def _safe_name(text: str) -> str:
+    t = str(text).encode("ascii", "ignore").decode("ascii")
+    t = re.sub(r"\W+", "_", t).strip("_")
+    return t or "UNKNOWN"
+
+
+# -----------------------------------------------------------------------
+# SEMANTIC JSON → SEED EXTRACTORS  (Python-first, no hallucination)
+# -----------------------------------------------------------------------
+
+def _extract_actor_name(a) -> str:
+    """
+    Safely extract a short actor name from whatever the LLM put in the actors array.
+    Handles: plain string "Manager", dict {"name":"Manager","description":"..."}, etc.
+    """
+    if isinstance(a, dict):
+        # Prefer explicit 'name' key; fall back to first short string value
+        raw = a.get("name") or a.get("role") or a.get("actor") or ""
+        if not raw:
+            # grab the shortest value that looks like a name
+            candidates = [str(v) for v in a.values() if v and len(str(v)) < 40]
+            raw = min(candidates, key=len) if candidates else str(a)
+    else:
+        raw = str(a)
+    # Keep only the first word/token — "Manager initiates..." → "Manager"
+    raw = raw.strip().split()[0] if raw.strip() else raw
+    return _safe_name(raw)[:20] or "Actor"
+
+
+def _extract_step_label(step) -> str:
+    """
+    Extract a clean short label from a sequence_step entry.
+    Handles: plain string, dict with 'step'/'action'/'description'/'name' key.
+    Returns a concise snake_case label, max 35 chars.
+    """
+    if isinstance(step, dict):
+        # Try common key names in preference order
+        for key in ("step", "action", "label", "name", "signal", "description"):
+            val = step.get(key, "")
+            if val and isinstance(val, str) and len(val.strip()) > 0:
+                raw = val.strip()
+                break
         else:
-            st.markdown('<div class="stage-card done">'
-                        '<div class="stage-title done">STAGE 02 — PROTOCOL INTELLIGENCE</div>'
-                        '<span class="badge badge-green">COMPLETE</span>'
-                        '</div>', unsafe_allow_html=True)
+            # Fall back to shortest non-empty string value
+            vals = [str(v) for v in step.values() if v and isinstance(v, str)]
+            raw = min(vals, key=len) if vals else ""
+    else:
+        raw = str(step).strip()
 
-            # Protocol classification
-            st.markdown('<div class="section-header">Protocol Classification</div>',
-                        unsafe_allow_html=True)
+    if not raw:
+        return ""
 
-            scores = proto_model["scores"]
-            sorted_scores = sorted(scores.items(), key=lambda x: -x[1])
-            score_html = ""
-            for proto, score in sorted_scores:
-                if score > 0:
-                    pct = min(score * 12, 100)
-                    is_primary = proto == proto_model["primary_protocol"]
-                    badge_cls  = "badge-blue" if is_primary else "badge-slate"
-                    score_html += f"""
-                    <div style='margin-bottom:8px'>
-                        <div style='display:flex;justify-content:space-between;
-                                    align-items:center;margin-bottom:3px'>
-                            <span style='font-family:IBM Plex Mono,monospace;
-                                         font-size:0.82rem;color:#e2e8f0'>{proto}</span>
-                            <span class='badge {badge_cls}'>
-                                {'PRIMARY' if is_primary else f'{score} kw'}
-                            </span>
-                        </div>
-                        <div style='height:4px;background:#1e293b;border-radius:2px'>
-                            <div style='height:4px;width:{pct}%;
-                                        background:{"#38bdf8" if is_primary else "#475569"};
-                                        border-radius:2px;transition:width 0.4s'></div>
-                        </div>
-                    </div>
-                    """
-            st.markdown(score_html, unsafe_allow_html=True)
+    # Collapse to a short snake_case identifier: take first 6 words
+    words = re.split(r"[\s_\-]+", raw)[:6]
+    label = "_".join(w for w in words if w)
+    label = re.sub(r"\W+", "_", label).strip("_")
+    return label[:35] or ""
 
-            col_c, col_d = st.columns(2)
 
-            with col_c:
-                # Actor roles
-                st.markdown('<div class="section-header">Actor-Role Mapping</div>',
-                            unsafe_allow_html=True)
-                for role, desc in proto_model["actor_roles"].items():
-                    st.markdown(
-                        f'<div style="padding:8px 10px;background:#0d1117;'
-                        f'border-radius:6px;border-left:3px solid #7c3aed;margin-bottom:6px">'
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:0.8rem;'
-                        f'color:#c4b5fd">{role}</div>'
-                        f'<div style="font-size:0.78rem;color:#94a3b8;margin-top:2px">{desc}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True
-                    )
+def _infer_direction(step, actor_set: list) -> tuple:
+    """
+    Guess from/to/type from a step's text content.
+    Keywords like 'assert', 'send', 'issue' → sync (initiator→target)
+    Keywords like 'respond', 'ready', 'ack', 'complete' → return (target→initiator)
+    """
+    if len(actor_set) < 2:
+        return actor_set[0], actor_set[0], "sync"
 
-                # Handshake rules
-                st.markdown('<div class="section-header">Protocol Rules</div>',
-                            unsafe_allow_html=True)
-                for rule in proto_model["handshake_rules"]:
-                    st.markdown(
-                        f'<div style="display:flex;gap:8px;padding:5px 0;'
-                        f'border-bottom:1px solid #1e293b">'
-                        f'<span style="color:#38bdf8;font-size:0.8rem">▸</span>'
-                        f'<span style="font-size:0.8rem;color:#cbd5e1">{rule}</span>'
-                        f'</div>',
-                        unsafe_allow_html=True
-                    )
+    text = ""
+    if isinstance(step, dict):
+        text = " ".join(str(v) for v in step.values()).lower()
+    else:
+        text = str(step).lower()
 
-            with col_d:
-                # Transactions
-                st.markdown('<div class="section-header">Transaction Recognition</div>',
-                            unsafe_allow_html=True)
-                for txn_name, steps in proto_model["transactions"].items():
-                    st.markdown(
-                        f'<div style="margin-bottom:10px;padding:10px 12px;'
-                        f'background:#0d1117;border-radius:8px;'
-                        f'border:1px solid #1e2330">'
-                        f'<div style="font-family:IBM Plex Mono,monospace;font-size:0.78rem;'
-                        f'color:#fbbf24;margin-bottom:6px">{txn_name}</div>',
-                        unsafe_allow_html=True
-                    )
-                    for i, step in enumerate(steps):
-                        st.markdown(
-                            f'<div style="font-size:0.76rem;color:#94a3b8;padding:2px 0;'
-                            f'padding-left:12px">'
-                            f'<span style="color:#334155">{i+1}.</span> {step}</div>',
-                            unsafe_allow_html=True
-                        )
-                    st.markdown('</div>', unsafe_allow_html=True)
+    # Signals that go from target back to initiator
+    return_keywords = ["awready", "wready", "arready", "crready",
+                       "bvalid", "rvalid", "acvalid",
+                       "ready", "ack", "response", "respond",
+                       "complete", "accept", "grant"]
+    # Signals asserted by the initiator/manager (go forward)
+    forward_keywords = ["awvalid", "wvalid", "arvalid", "crvalid",
+                        "bready", "rready", "acready",
+                        "assert", "issue", "send", "initiat"]
+    for kw in forward_keywords:
+        if kw in text:
+            return actor_set[0], actor_set[-1], "sync"
+    for kw in return_keywords:
+        if kw in text:
+            return actor_set[-1], actor_set[0], "return"
 
-            with st.expander("Export: Protocol Model JSON"):
-                st.json(proto_model)
+    return actor_set[0], actor_set[-1], "sync"
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # TAB 3 — Flow Generator
-    # ──────────────────────────────────────────────────────────────────────────
-    with tab3:
-        if not flow_model:
-            st.info("Run the pipeline to see Flow Generator results.")
+
+def _seed_sequence(semantic_json: dict) -> dict:
+    """Pull actors and message candidates directly from semantic_json."""
+    signals      = semantic_json.get("signals", [])
+    transactions = semantic_json.get("transactions", [])
+    timing       = semantic_json.get("timing_conditions", [])
+    constraints  = semantic_json.get("constraints", [])
+
+    # ── Actors: extract clean names from transaction actors ──────────────
+    actor_set: list = []
+    for txn in transactions[:10]:
+        for a in txn.get("actors", []):
+            name = _extract_actor_name(a)
+            if name and name not in actor_set:
+                actor_set.append(name)
+
+    # Deduplicate actors that are the same word with different casing
+    seen_lower, deduped = set(), []
+    for a in actor_set:
+        if a.lower() not in seen_lower:
+            seen_lower.add(a.lower())
+            deduped.append(a)
+    actor_set = deduped
+
+    # Fall back to signal-direction inference if not enough actors found
+    if len(actor_set) < 2:
+        has_master = any("master" in s.get("direction","").lower()
+                         or "output" in s.get("direction","").lower()
+                         for s in signals)
+        has_slave  = any("slave"  in s.get("direction","").lower()
+                         or "input"  in s.get("direction","").lower()
+                         for s in signals)
+        if has_master and "Master" not in actor_set:
+            actor_set.append("Master")
+        if has_slave and "Slave" not in actor_set:
+            actor_set.append("Slave")
+        if len(actor_set) < 2:
+            actor_set = ["Manager", "Subordinate"]
+
+    actor_set = actor_set[:4]
+
+    # ── Messages: transactions → timing → signals → constraints ──────────
+    messages: list = []
+
+    # 1. From transaction sequence_steps with proper directionality
+    for txn in transactions[:8]:
+        steps = txn.get("sequence_steps", [])
+        for step in steps[:6]:
+            label = _extract_step_label(step)
+            if not label:
+                continue
+            frm, to, mtype = _infer_direction(step, actor_set)
+            # Avoid exact duplicate labels
+            if not any(m["label"] == label for m in messages):
+                messages.append({"from": frm, "to": to, "label": label, "type": mtype})
+
+    # 2. From timing conditions — triggers go forward, responses come back
+    for tc in timing[:8]:
+        trigger  = _extract_step_label(tc.get("trigger",  ""))
+        response = _extract_step_label(tc.get("response", ""))
+        if trigger and not any(m["label"] == trigger for m in messages):
+            messages.append({
+                "from": actor_set[0], "to": actor_set[-1],
+                "label": trigger, "type": "sync"
+            })
+        if response and not any(m["label"] == response for m in messages):
+            messages.append({
+                "from": actor_set[-1], "to": actor_set[0],
+                "label": response, "type": "return"
+            })
+
+    # 3. From signals — use actual direction field
+    for sig in signals[:12]:
+        name = _safe_name(sig.get("name", ""))
+        if not name or any(m["label"] == name for m in messages):
+            continue
+        direction = sig.get("direction", "").lower()
+        if "output" in direction or "master" in direction:
+            frm, to, mtype = actor_set[0], actor_set[-1], "sync"
+        elif "input" in direction or "slave" in direction:
+            frm, to, mtype = actor_set[-1], actor_set[0], "return"
         else:
-            st.markdown('<div class="stage-card done">'
-                        '<div class="stage-title done">STAGE 03 — FLOW GENERATOR</div>'
-                        '<span class="badge badge-green">COMPLETE</span>'
-                        '</div>', unsafe_allow_html=True)
+            frm, to, mtype = actor_set[0], actor_set[-1], "sync"
+        messages.append({"from": frm, "to": to, "label": name, "type": mtype})
 
-            col_e, col_f = st.columns(2)
+    # 4. Key constraints as notes on the initiating actor
+    for c in constraints[:3]:
+        rule = _extract_step_label(c.get("rule", ""))
+        if rule and not any(m["label"] == rule for m in messages):
+            messages.append({"from": actor_set[0], "to": actor_set[0],
+                             "label": rule, "type": "note"})
 
-            with col_e:
-                st.markdown('<div class="section-header">PlantUML — Sequence Diagram</div>',
-                            unsafe_allow_html=True)
-                st.markdown(
-                    f'<div class="plantuml-block">{flow_model["sequence_uml"]}</div>',
-                    unsafe_allow_html=True
-                )
+    return {"actors": actor_set, "messages": messages[:25]}
 
-            with col_f:
-                st.markdown('<div class="section-header">PlantUML — FSM State Diagram</div>',
-                            unsafe_allow_html=True)
-                st.markdown(
-                    f'<div class="plantuml-block">{flow_model["state_uml"]}</div>',
-                    unsafe_allow_html=True
-                )
 
-            # FSM states
-            st.markdown('<div class="section-header">FSM State Inventory</div>',
-                        unsafe_allow_html=True)
-            states_html = "".join(
-                f'<span class="signal-chip" style="color:#a5f3fc">{s}</span>'
-                for s in flow_model["fsm_states"]
-            )
-            st.markdown(states_html, unsafe_allow_html=True)
+def _seed_fsm(semantic_json: dict) -> dict:
+    """Pull states and transitions directly from semantic_json."""
+    transactions = semantic_json.get("transactions", [])
+    timing       = semantic_json.get("timing_conditions", [])
 
-            # Condition logic table
-            if flow_model["logic_table"]:
-                st.markdown('<div class="section-header">Condition → Logic Table</div>',
-                            unsafe_allow_html=True)
-                import pandas as pd
-                df = pd.DataFrame(flow_model["logic_table"])
-                df.columns = ["Condition (Raw)", "Normalized Form"]
-                st.dataframe(df, use_container_width=True, hide_index=True)
+    states: list      = []
+    transitions: list = []
 
-            # Download buttons
-            st.markdown('<div class="section-header">Download Artifacts</div>',
-                        unsafe_allow_html=True)
-            d1, d2, d3 = st.columns(3)
-            with d1:
-                st.download_button(
-                    "⬇ Sequence UML",
-                    data=flow_model["sequence_uml"],
-                    file_name="efs_sequence.puml",
-                    mime="text/plain",
-                )
-            with d2:
-                st.download_button(
-                    "⬇ State UML",
-                    data=flow_model["state_uml"],
-                    file_name="efs_state.puml",
-                    mime="text/plain",
-                )
-            with d3:
-                full_json = json.dumps(
-                    {"spec": spec_model, "protocol": proto_model, "flow": flow_model},
-                    indent=2,
-                )
-                st.download_button(
-                    "⬇ Full JSON",
-                    data=full_json,
-                    file_name="efs_pipeline_output.json",
-                    mime="application/json",
-                )
+    # States from transaction sequence steps (each step = a state)
+    for txn in transactions[:5]:
+        steps = txn.get("sequence_steps", [])
+        prev = None
+        for step in steps[:6]:
+            # Use the proper label extractor then truncate/uppercase for state name
+            label = _extract_step_label(step)
+            state = label[:18].upper() if label else ""
+            if not state or state in states:
+                continue
+            states.append(state)
+            if prev:
+                # Use the signal name from the step as the transition label
+                transitions.append({"from": prev, "to": state, "label": label[:30]})
+            prev = state
 
-            with st.expander("Export: Flow Model JSON"):
-                st.json(flow_model)
+    # States from timing trigger → response pairs
+    for tc in timing[:6]:
+        trigger  = _extract_step_label(tc.get("trigger",  ""))[:18].upper()
+        response = _extract_step_label(tc.get("response", ""))[:18].upper()
+        for candidate in [trigger, response]:
+            if candidate and candidate not in states:
+                states.append(candidate)
+        if trigger and response and trigger in states and response in states:
+            label = _extract_step_label(tc.get("trigger", ""))[:30]
+            transitions.append({"from": trigger, "to": response, "label": label})
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # TAB 4 — Raw Markdown
-    # ──────────────────────────────────────────────────────────────────────────
-    with tab4:
-        st.markdown('<div class="section-header">LlamaParse Extracted Markdown</div>',
-                    unsafe_allow_html=True)
-        st.text_area(
-            label="",
-            value=markdown_text,
-            height=500,
-            label_visibility="collapsed",
+    # Guarantee minimum viable FSM
+    if not states:
+        states = ["IDLE", "ACTIVE", "COMPLETE"]
+        transitions = [
+            {"from": "IDLE",     "to": "ACTIVE",   "label": "start"},
+            {"from": "ACTIVE",   "to": "COMPLETE", "label": "done"},
+            {"from": "COMPLETE", "to": "IDLE",     "label": "reset"},
+        ]
+
+    # Always add ERROR + reset path
+    if "ERROR" not in states:
+        states.append("ERROR")
+    error_src = states[1] if len(states) > 1 else states[0]
+    transitions.append({"from": error_src, "to": "ERROR",   "label": "timeout"})
+    transitions.append({"from": "ERROR",   "to": states[0], "label": "reset"})
+
+    initial = states[0]
+    return {"initial_state": initial, "states": states[:14], "transitions": transitions[:20]}
+
+
+def _seed_timing(semantic_json: dict) -> dict:
+    """Pull real signal names and timing events directly from semantic_json."""
+    signals  = semantic_json.get("signals", [])
+    timing   = semantic_json.get("timing_conditions", [])
+
+    # Priority keywords for signal selection
+    priority_keywords = ["clk", "clock", "reset", "resetn", "valid", "ready", "data",
+                         "addr", "enable", "ack", "last", "strobe"]
+
+    def priority(sig):
+        name = sig.get("name", "").lower()
+        for i, kw in enumerate(priority_keywords):
+            if kw in name:
+                return i
+        return 99
+
+    sorted_sigs = sorted(signals, key=priority)[:6]
+    sig_names   = [_safe_name(s.get("name", "SIG")) for s in sorted_sigs]
+
+    # Use actual timing conditions to build events
+    sig_events: dict = {name: [] for name in sig_names}
+    t = 0
+    for tc in timing[:10]:
+        trigger  = str(tc.get("trigger",  ""))
+        response = str(tc.get("response", ""))
+        for name in sig_names:
+            base = name.lower()
+            if base in trigger.lower():
+                sig_events[name].append({"time": t,      "state": "1"})
+            if base in response.lower():
+                sig_events[name].append({"time": t + 10, "state": "0"})
+        t += 20
+
+    # Fill any signal with no matched events with a default toggle pattern
+    for name in sig_names:
+        if not sig_events[name]:
+            sig_events[name] = [
+                {"time": 0,  "state": "0"},
+                {"time": 20, "state": "1"},
+                {"time": 60, "state": "0"},
+            ]
+
+    # Classify binary vs concise
+    binary_keywords = ["clk", "clock", "reset", "resetn", "valid", "ready", "enable",
+                       "ack", "last", "strobe", "irq", "req", "grant", "sel"]
+    result_signals = []
+    for name in sig_names:
+        is_binary = any(kw in name.lower() for kw in binary_keywords)
+        stype  = "binary" if is_binary else "concise"
+        events = sig_events[name]
+        if stype == "concise":
+            labeled = []
+            for ev in events:
+                state = ev["state"]
+                if state in ("0", "1"):
+                    state = "IDLE" if state == "0" else "ACTIVE"
+                labeled.append({"time": ev["time"], "state": state})
+            events = labeled
+        result_signals.append({"name": name, "type": stype, "events": events})
+
+    # Find clock signal name from extracted signals
+    clk_name = "CLK"
+    for s in signals:
+        if "clk" in s.get("name", "").lower() or "clock" in s.get("name", "").lower():
+            clk_name = _safe_name(s["name"])
+            break
+
+    max_time = max(
+        (ev["time"] for sig in result_signals for ev in sig["events"]),
+        default=60
+    )
+    highlights = [{"start": 20, "end": max_time - 10, "label": "transaction_window"}]
+
+    return {
+        "clock_signal": clk_name,
+        "clock_period": 10,
+        "signals": result_signals,
+        "highlights": highlights,
+    }
+
+
+# -----------------------------------------------------------------------
+# LLM ENRICHMENT — takes Python seed, LLM orders/labels only, cannot invent
+# -----------------------------------------------------------------------
+
+def _llm_enrich_sequence(seed: dict, semantic_json: dict) -> dict:
+    """LLM reorders and labels seed messages — cannot invent new ones."""
+    protocol = semantic_json.get("document_metadata", {}).get("protocol", "unknown")
+    prompt = f"""
+You are a {protocol} protocol expert.
+Below is a SEED sequence diagram built from the actual specification.
+Your job is to REORDER and optionally RENAME the messages for clarity.
+You may NOT add messages that are not in the seed.
+You may NOT change actor names.
+You may only remove exact duplicates.
+
+Return ONLY this JSON:
+{{
+  "actors": {json.dumps(seed["actors"])},
+  "messages": [
+    {{"from":"...", "to":"...", "label":"...", "type":"sync|return|note"}}
+  ]
+}}
+
+SEED:
+{json.dumps(seed, indent=2)}
+"""
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant", temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result = json.loads(completion.choices[0].message.content)
+        # Safety: if LLM changed actors, fall back to seed
+        if set(result.get("actors", [])) != set(seed["actors"]):
+            result["actors"] = seed["actors"]
+        return result
+    except Exception:
+        return seed
+
+
+def _llm_enrich_fsm(seed: dict, semantic_json: dict) -> dict:
+    """LLM improves transition labels — cannot invent new states."""
+    protocol    = semantic_json.get("document_metadata", {}).get("protocol", "unknown")
+    constraints = semantic_json.get("constraints", [])[:10]
+    prompt = f"""
+You are a {protocol} FSM expert.
+Below is a SEED FSM built from the actual specification.
+Your job is to improve transition LABELS using the constraints below.
+You may NOT add or remove states or transitions.
+You may NOT change state names.
+
+Return ONLY this JSON — same structure as the seed, with better labels only:
+{{
+  "initial_state": "{seed["initial_state"]}",
+  "states": {json.dumps(seed["states"])},
+  "transitions": [
+    {{"from":"...", "to":"...", "label":"..."}}
+  ]
+}}
+
+Constraints from spec: {json.dumps(constraints)}
+SEED: {json.dumps(seed, indent=2)}
+"""
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant", temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result = json.loads(completion.choices[0].message.content)
+        # Safety: enforce seed states are preserved exactly
+        if set(result.get("states", [])) != set(seed["states"]):
+            result["states"]        = seed["states"]
+            result["initial_state"] = seed["initial_state"]
+        return result
+    except Exception:
+        return seed
+
+
+def _llm_enrich_timing(seed: dict, semantic_json: dict) -> dict:
+    """LLM can only adjust concise state labels — cannot change signal names or times."""
+    protocol = semantic_json.get("document_metadata", {}).get("protocol", "unknown")
+    timing   = semantic_json.get("timing_conditions", [])[:8]
+    prompt = f"""
+You are a {protocol} timing expert.
+Below is a SEED timing diagram with real signals from the specification.
+You may ONLY improve the state labels for 'concise' type signals.
+You may NOT change signal names, event times, add signals, or remove signals.
+You may NOT change binary signal states (must remain "0" or "1").
+
+Return ONLY this JSON with the same structure as the seed:
+{json.dumps(seed, indent=2)}
+
+Use these timing conditions to pick better concise state labels (max 12 chars, no spaces):
+{json.dumps(timing)}
+"""
+    try:
+        completion = client.chat.completions.create(
+            model="llama-3.1-8b-instant", temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[{"role": "user", "content": prompt}]
+        )
+        result = json.loads(completion.choices[0].message.content)
+        # Safety: reject if LLM changed signal names
+        seed_names   = {s["name"] for s in seed["signals"]}
+        result_names = {s["name"] for s in result.get("signals", [])}
+        if seed_names != result_names:
+            return seed
+        return result
+    except Exception:
+        return seed
+
+
+# -----------------------------------------------------------------------
+# PLANTUML TEMPLATE BUILDERS — guaranteed-valid syntax
+# -----------------------------------------------------------------------
+import re
+def group_messages(messages):
+
+    grouped=[]
+
+    current_phase=None
+
+
+    PHASE_RULES = [
+      ("request", [
+          "request","req",
+          "address","addr",
+          "command","cmd"
+      ]),
+
+      ("data",[
+          "data","write","read",
+          "payload","transfer"
+      ]),
+
+      ("response",[
+          "response","resp",
+          "ready","ack",
+          "valid","complete"
+      ])
+    ]
+
+
+    def classify(label):
+
+        text=label.lower()
+
+        for phase,words in PHASE_RULES:
+            for w in words:
+                if w in text:
+                    return phase
+
+        return None
+
+
+    for msg in messages:
+
+        if msg.get("type") in [
+           "note","alt","loop"
+        ]:
+            grouped.append(msg)
+            continue
+
+
+        phase = classify(
+            msg.get("label","")
         )
 
-else:
-    # ── Empty state ────────────────────────────────────────────────────────────
-    st.markdown("""
-    <div style='text-align:center;padding:4rem 2rem;
-                background:linear-gradient(135deg,#0d1117,#111827);
-                border:1px dashed #1e293b;border-radius:16px;margin-top:2rem'>
-        <div style='font-size:3rem;margin-bottom:1rem'>⚡</div>
-        <div style='font-size:1.2rem;font-weight:600;color:#e2e8f0;margin-bottom:0.5rem'>
-            Ready to process your specification
-        </div>
-        <div style='color:#475569;font-size:0.9rem;max-width:500px;margin:0 auto'>
-            Upload a PDF/DOCX protocol specification — or enable Demo Mode —
-            then click <strong style='color:#38bdf8'>▶ Run EFS Pipeline</strong>
-            to execute all three stages.
-        </div>
-        <div style='margin-top:2rem;display:flex;justify-content:center;gap:2rem;
-                    flex-wrap:wrap'>
-            <div style='text-align:center'>
-                <div style='font-family:IBM Plex Mono,monospace;font-size:0.7rem;
-                             color:#38bdf8;letter-spacing:0.1em'>STAGE 01</div>
-                <div style='color:#64748b;font-size:0.8rem'>Spec Intelligence</div>
-            </div>
-            <div style='color:#1e293b;font-size:1.2rem;align-self:center'>→</div>
-            <div style='text-align:center'>
-                <div style='font-family:IBM Plex Mono,monospace;font-size:0.7rem;
-                             color:#a78bfa;letter-spacing:0.1em'>STAGE 02</div>
-                <div style='color:#64748b;font-size:0.8rem'>Protocol Intelligence</div>
-            </div>
-            <div style='color:#1e293b;font-size:1.2rem;align-self:center'>→</div>
-            <div style='text-align:center'>
-                <div style='font-family:IBM Plex Mono,monospace;font-size:0.7rem;
-                             color:#4ade80;letter-spacing:0.1em'>STAGE 03</div>
-                <div style='color:#64748b;font-size:0.8rem'>Flow Generator</div>
-            </div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
+
+        if phase and phase != current_phase:
+
+            grouped.append({
+                "type":"divider",
+                "label":phase.title()+" Phase"
+            })
+
+            current_phase=phase
+
+
+        grouped.append(msg)
+
+
+    return grouped
+
+def repair_messages(messages):
+
+    repaired=[]
+    seen=set()
+
+    for msg in messages:
+
+        msg=dict(msg)
+        label=str(msg.get("label","")).strip()
+
+        frm=str(msg.get("from","Actor1"))
+        to=str(msg.get("to","Actor2"))
+
+        mtype=msg.get("type","sync")
+
+
+        # -----------------------------
+        # 1 Deduplicate repeated events
+        # -----------------------------
+        key=(frm,to,label,mtype)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+
+        # -----------------------------
+        # 2 Convert descriptive prose
+        # into notes automatically
+        # -----------------------------
+        if len(label.split()) > 6:
+            msg["type"]="note"
+            repaired.append(msg)
+            continue
+
+
+        # -----------------------------
+        # 3 Actor ownership inferred
+        # from "X asserts Y" patterns
+        # -----------------------------
+        m = re.match(
+           r'([A-Za-z0-9_]+)_asserts_(.+)',
+           label
+        )
+
+        if m:
+            actor = m.group(1)
+            event = m.group(2)
+
+            old_from = frm
+            old_to = to
+
+            msg["from"] = actor
+
+            if actor == old_from:
+                msg["to"] = old_to
+            else:
+                msg["to"] = old_from
+            msg["label"] = f"Assert {event}"
+
+            repaired.append(msg)
+            continue
+
+
+
+        # -----------------------------
+        # 4 Convert bare identifiers
+        # into event labels
+        # -----------------------------
+        if re.match(
+            r'^[A-Z0-9_]+$',
+            label
+        ):
+            msg["label"]=f"Event {label}"
+
+
+        # -----------------------------
+        # 5 Detect likely conditions
+        # and convert to note
+        # -----------------------------
+        if any(k in label.lower()
+               for k in [
+                 "must",
+                 "wait",
+                 "after",
+                 "before",
+                 "until"
+               ]):
+            msg["type"]="note"
+
+
+        repaired.append(msg)
+
+
+    return repaired
+def _build_sequence_puml(content: dict) -> str:
+    """
+    Generic protocol-agnostic PUML sequence generator.
+    Works for arbitrary protocols if parser emits structured messages.
+    """
+
+    actors = [
+        _safe_name(a)
+        for a in content.get("actors", ["Actor1","Actor2"])
+    ]
+
+    lines = [
+        "@startuml",
+        "skinparam sequenceMessageAlign center",
+        "skinparam sequenceArrowThickness 2",
+        "skinparam roundcorner 5",
+
+        "skinparam participant {",
+        " BackgroundColor #1e3a5f",
+        " BorderColor #63b3ed",
+        " FontColor #e2e8f0",
+        "}",
+
+        "skinparam note {",
+        " BackgroundColor #1a3a2a",
+        " BorderColor #48bb78",
+        " FontColor #9ae6b4",
+        "}",
+        ""
+    ]
+
+    
+    # Participants
+    for a in actors:
+        lines.append(f"participant {a}")
+
+    lines.append("")
+
+
+    seen = set()
+
+
+    for msg in content.get("messages",[]):
+
+        mtype = msg.get("type","sync")
+
+
+        # -------------------------
+        # Divider / Phase grouping
+        # -------------------------
+        if mtype=="divider":
+            label = _safe(
+                msg.get("label","Phase"),
+                80
+            )
+            lines.append(f"== {label} ==")
+            continue
+
+
+        # -------------------------
+        # Notes
+        # -------------------------
+        if mtype=="note":
+            frm = _safe_name(msg.get("from",actors[0]))
+            to  = _safe_name(msg.get("to",frm))
+
+            label = _safe(
+                str(msg.get("label","")),
+                120
+            )
+
+            over = frm if frm==to else f"{frm},{to}"
+            lines.append(
+                f"note over {over}: {label}"
+            )
+            continue
+
+
+        # -------------------------
+        # Alternatives
+        # -------------------------
+        if mtype=="alt":
+            cond = _safe(
+                msg.get("condition","Condition"),
+                80
+            )
+            lines.append(f"alt {cond}")
+            continue
+
+
+        if mtype=="else":
+            cond = _safe(
+                msg.get("condition","Else"),
+                80
+            )
+            lines.append(f"else {cond}")
+            continue
+
+
+        if mtype=="end_alt":
+            lines.append("end")
+            continue
+
+
+        # -------------------------
+        # Loops
+        # -------------------------
+        if mtype=="loop":
+            cond = _safe(
+                msg.get("condition","Loop"),
+                80
+            )
+            lines.append(
+                f"loop {cond}"
+            )
+            continue
+
+
+        if mtype=="end_loop":
+            lines.append("end")
+            continue
+
+
+        # -------------------------
+        # Optional block
+        # -------------------------
+        if mtype=="opt":
+            cond = _safe(
+                msg.get("condition","Optional"),
+                80
+            )
+            lines.append(
+                f"opt {cond}"
+            )
+            continue
+
+
+        if mtype=="end_opt":
+            lines.append("end")
+            continue
+
+
+        # -------------------------
+        # Standard messages
+        # -------------------------
+        frm = _safe_name(
+            msg.get("from",actors[0])
+        )
+
+        to = _safe_name(
+            msg.get("to",actors[-1])
+        )
+
+        label = _safe(
+            str(msg.get("label","event")),
+            120
+        )
+
+
+        # Remove duplicates
+        key = (frm,to,label,mtype)
+        if key in seen:
+            continue
+        seen.add(key)
+
+
+        if mtype=="return":
+            lines.append(
+                f"{frm} --> {to}: {label}"
+            )
+
+        else:
+            lines.append(
+                f"{frm} -> {to}: {label}"
+            )
+
+
+    lines += [
+        "",
+        "@enduml"
+    ]
+
+    return "\n".join(lines)
+
+def build_fsm_puml(messages):
+
+    states = infer_fsm_states(messages)
+
+    lines=[
+       "@startuml",
+       "[*] --> IDLE"
+    ]
+
+
+    prev="IDLE"
+
+    for s in states:
+
+        lines.append(
+           f"{prev} --> {s}"
+        )
+
+        prev=s
+
+
+    lines.append(
+       f"{prev} --> IDLE"
+    )
+
+    lines.append("@enduml")
+
+    return "\n".join(lines)
+def _build_fsm_puml(content: dict) -> str:
+    states  = [_safe_name(s) for s in content.get("states", ["IDLE", "ACTIVE", "ERROR"])]
+    initial = _safe_name(content.get("initial_state", states[0] if states else "IDLE"))
+    transitions = content.get("transitions", [])
+
+    lines = [
+        "@startuml",
+        "skinparam state {",
+        "  BackgroundColor #1e3a5f",
+        "  BorderColor #63b3ed",
+        "  FontColor #e2e8f0",
+        "  ArrowColor #63b3ed",
+        "}",
+        "",
+    ]
+
+    for s in states:
+        if s == "ERROR":
+            lines.append(f"state {s} #742a2a")
+        else:
+            lines.append(f"state {s}")
+    lines.append("")
+
+    lines.append(f"[*] --> {initial}")
+
+    for t in transitions:
+        frm   = _safe_name(str(t.get("from",  "IDLE")))
+        to    = _safe_name(str(t.get("to",    "IDLE")))
+        label = _safe(str(t.get("label", "")), 35)
+        if label:
+            lines.append(f"{frm} --> {to} : {label}")
+        else:
+            lines.append(f"{frm} --> {to}")
+
+    lines += ["", "@enduml"]
+    return "\n".join(lines)
+
+
+def _build_timing_puml(content: dict) -> str:
+    from itertools import groupby
+
+    clock_name  = _safe_name(content.get("clock_signal", "CLK"))
+    clock_period = max(1, int(content.get("clock_period", 10)))
+    signals    = content.get("signals", [])
+    highlights = content.get("highlights", [])
+
+    lines = ["@startuml", ""]
+
+    lines.append(f"clock {clock_name} with period {clock_period}")
+    lines.append("")
+
+    declared = []
+    for sig in signals:
+        name   = _safe_name(str(sig.get("name", "SIG")))
+        stype  = sig.get("type", "binary")
+        events = sig.get("events", [])
+        if not events:
+            continue
+        if stype == "binary":
+            lines.append(f'robust "{name}" as {name}')
+        else:
+            lines.append(f'concise "{name}" as {name}')
+        declared.append((name, stype, events))
+
+    lines.append("")
+
+    all_events = []
+    for name, stype, events in declared:
+        for ev in events:
+            try:
+                t = int(ev.get("time", 0))
+            except (ValueError, TypeError):
+                t = 0
+            state = _safe(str(ev.get("state", "0")), 20)
+            if stype == "binary":
+                state = "1" if state in ("1", "HIGH", "high", "True", "true", "H") else "0"
+            all_events.append((t, name, stype, state))
+
+    all_events.sort(key=lambda x: x[0])
+
+    for t, grp in groupby(all_events, key=lambda x: x[0]):
+        lines.append(f"@{t}")
+        for _, name, stype, state in grp:
+            if stype == "binary":
+                lines.append(f"{name} is {state}")
+            else:
+                lines.append(f'{name} is "{state}"')
+        lines.append("")
+
+    for h in highlights:
+        try:
+            start = int(h.get("start", 0))
+            end   = int(h.get("end",   0))
+        except (ValueError, TypeError):
+            continue
+        label = _safe(str(h.get("label", "")), 30)
+        if start < end:
+            if label:
+                lines.append(f"highlight {start} to {end} : {label}")
+            else:
+                lines.append(f"highlight {start} to {end}")
+
+    lines += ["", "@enduml"]
+    return "\n".join(lines)
+
+
+# -----------------------------------------------------------------------
+# PUBLIC DIAGRAM GENERATORS — seed → enrich pipeline
+# -----------------------------------------------------------------------
+
+def _generate_sequence_diagram(semantic_json: dict) -> str:
+    seed    = _seed_sequence(semantic_json)
+    content = _llm_enrich_sequence(seed, semantic_json)
+    content["messages"] = repair_messages(
+        content.get("messages", [])
+    )
+    content["messages"] = group_messages(
+    content["messages"]
+)
+
+    return _build_sequence_puml(content)
+
+
+
+def _generate_fsm_diagram(semantic_json: dict) -> str:
+    seed    = _seed_fsm(semantic_json)
+    content = _llm_enrich_fsm(seed, semantic_json)
+    return _build_fsm_puml(content)
+
+
+def _generate_timing_diagram(semantic_json: dict) -> str:
+    seed    = _seed_timing(semantic_json)
+    content = _llm_enrich_timing(seed, semantic_json)
+    return _build_timing_puml(content)
+
+
+# -----------------------------------------------------------------------
+# SIDEBAR
+# -----------------------------------------------------------------------
+with st.sidebar:
+    st.header("Configuration")
+    st.info("Requires:\n- LLAMA_CLOUD_API_KEY\n- GROQ_API_KEY")
+    st.header("Extraction Options")
+    extraction_mode = st.selectbox(
+        "Extraction Mode", ["basic", "deep_semantic"],
+        help="Basic: Fast | Deep: Comprehensive"
+    )
+    chunk_size = st.slider("Chunk Size", 4000, 12000, 8000, 1000)
+    st.header("Future Features")
+    st.info("🚧 Knowledge Graph (Coming Soon)")
+
+
+# -----------------------------------------------------------------------
+# FILE UPLOAD
+# -----------------------------------------------------------------------
+uploaded = st.file_uploader("Upload Spec Document", type=["pdf", "docx"])
+
+if uploaded:
+    uploaded.seek(0)
+    file_extension = os.path.splitext(uploaded.name)[1]
+    st.write(f"📄 **{uploaded.name}**  |  ext: `{file_extension}`")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
+        file_content = uploaded.read()
+        tmp.write(file_content)
+        temp_path = tmp.name
+
+    st.write(f"📊 File size: {len(file_content)} bytes")
+
+    if not os.path.exists(temp_path):
+        st.error("❌ Failed to create temporary file")
+        st.stop()
+
+    for key in ["extracted_markdown", "semantic_json", "protocol_result",
+                "sequence_diagram", "fsm_diagram", "timing_diagram"]:
+        if key not in st.session_state:
+            st.session_state[key] = None
+
+    if st.button("Run Spec Intelligence"):
+        try:
+            with st.spinner("Parsing with LlamaParse..."):
+                md = parse_document(temp_path)
+            st.success(f"✅ Markdown extraction complete — {len(md):,} characters")
+            st.session_state.extracted_markdown = md
+        except Exception as e:
+            st.error(str(e))
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+    if st.session_state.extracted_markdown:
+        md = st.session_state.extracted_markdown
+        col1, col2 = st.columns([3, 1])
+
+        with col1:
+            st.subheader("Extracted Markdown")
+            st.download_button("⬇️ Download Markdown", md, file_name="spec_readme.md")
+
+            tabs = st.tabs(["Rendered", "Raw Markdown", "Semantic JSON", "📐 Diagrams & FSM"])
+
+            with tabs[0]:
+                st.markdown(md)
+
+            with tabs[1]:
+                st.code(md, language="markdown")
+
+            # ── Semantic JSON tab ────────────────────────────────────────────
+            with tabs[2]:
+                st.subheader("Semantic JSON Extraction")
+                st.write(f"🔑 GROQ: {'✅' if GROQ_API_KEY else '❌'}  |  "
+                         f"LLAMA: {'✅' if LLAMA_CLOUD_API_KEY else '❌'}")
+                st.divider()
+
+                if st.button("🔧 Test Groq API", key="api_test_btn"):
+                    try:
+                        r = client.chat.completions.create(
+                            model="llama-3.1-8b-instant", temperature=0.1,
+                            messages=[{"role": "user", "content": 'Return {"status":"ok"}'}]
+                        )
+                        st.code(r.choices[0].message.content)
+                        st.success("🎉 Groq API working!")
+                    except Exception as e:
+                        st.error(f"❌ {str(e)}")
+
+                if st.button("🧠 Run Semantic Extraction", key="semantic_btn"):
+                    with st.spinner("Building Spec Semantic Model..."):
+                        try:
+                            result = extract_semantic_json(md, extraction_mode, chunk_size)
+                            if result:
+                                st.session_state.semantic_json = result
+                                st.success("✅ Semantic extraction complete!")
+                            else:
+                                st.error("❌ No results returned")
+                        except Exception as e:
+                            st.error(f"❌ {str(e)}")
+
+                if st.session_state.semantic_json:
+                    sd = st.session_state.semantic_json
+                    st.download_button(
+                        "💾 Download semantic_json.json",
+                        data=json.dumps(sd, indent=2),
+                        file_name="semantic_json.json",
+                        mime="application/json"
+                    )
+                    st.json(sd)
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Signals",      len(sd.get("signals",      [])))
+                    c2.metric("Transactions", len(sd.get("transactions", [])))
+                    c3.metric("Constraints",  len(sd.get("constraints",  [])))
+                else:
+                    st.info("Click **Run Semantic Extraction** to generate structured JSON.")
+
+            # ── Diagrams tab ─────────────────────────────────────────────────
+            with tabs[3]:
+                st.subheader("📐 PlantUML Diagrams — Sequence / FSM / Timing")
+
+                protocol_label = "unknown"
+                if st.session_state.protocol_result:
+                    protocol_label = st.session_state.protocol_result.get("protocol", "unknown")
+                elif st.session_state.semantic_json:
+                    protocol_label = (
+                        st.session_state.semantic_json
+                        .get("document_metadata", {})
+                        .get("protocol", "unknown")
+                    )
+
+                st.caption(f"Protocol: **{protocol_label}** — run Semantic Extraction first.")
+
+                if not st.session_state.semantic_json:
+                    st.warning("⚠️ Run **Semantic Extraction** (Semantic JSON tab) first.")
+                else:
+                    sj = st.session_state.semantic_json
+
+                    # ── Debug info: show what the seed extractors found ──────
+                    with st.expander("🔍 Seed Data Preview (what Python extracted from semantic JSON)"):
+                        seed_tabs = st.tabs(["Sequence seed", "FSM seed", "Timing seed"])
+                        with seed_tabs[0]:
+                            st.json(_seed_sequence(sj))
+                        with seed_tabs[1]:
+                            st.json(_seed_fsm(sj))
+                        with seed_tabs[2]:
+                            st.json(_seed_timing(sj))
+
+                    diagram_type = st.radio(
+                        "Diagram type",
+                        ["📨 Sequence Diagram", "🔁 Finite State Machine (FSM)",
+                         "⏱️ Signal Timing Diagram", "🗂️ All Three"],
+                        horizontal=True, key="diagram_type_radio"
+                    )
+
+                    rc1, rc2, rc3 = st.columns(3)
+                    regen_seq    = rc1.button("♻️ Regen Sequence", key="regen_seq")
+                    regen_fsm    = rc2.button("♻️ Regen FSM",      key="regen_fsm")
+                    regen_timing = rc3.button("♻️ Regen Timing",   key="regen_timing")
+
+                    if st.button("🚀 Generate Diagrams", key="gen_diagrams_btn"):
+                        need_seq    = diagram_type in ("📨 Sequence Diagram",             "🗂️ All Three")
+                        need_fsm    = diagram_type in ("🔁 Finite State Machine (FSM)",   "🗂️ All Three")
+                        need_timing = diagram_type in ("⏱️ Signal Timing Diagram",        "🗂️ All Three")
+
+                        if need_seq:
+                            with st.spinner("Building Sequence Diagram from semantic JSON..."):
+                                try:
+                                    st.session_state.sequence_diagram = _generate_sequence_diagram(sj)
+                                    st.success("✅ Sequence ready")
+                                except Exception as e:
+                                    st.error(f"❌ Sequence: {e}")
+                        if need_fsm:
+                            with st.spinner("Building FSM from semantic JSON..."):
+                                try:
+                                    st.session_state.fsm_diagram = _generate_fsm_diagram(sj)
+                                    st.success("✅ FSM ready")
+                                except Exception as e:
+                                    st.error(f"❌ FSM: {e}")
+                        if need_timing:
+                            with st.spinner("Building Timing Diagram from semantic JSON..."):
+                                try:
+                                    st.session_state.timing_diagram = _generate_timing_diagram(sj)
+                                    st.success("✅ Timing ready")
+                                except Exception as e:
+                                    st.error(f"❌ Timing: {e}")
+
+                    if regen_seq:
+                        with st.spinner("Regenerating Sequence from semantic JSON..."):
+                            try:
+                                st.session_state.sequence_diagram = _generate_sequence_diagram(sj)
+                                st.success("✅ Done")
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+
+                    if regen_fsm:
+                        with st.spinner("Regenerating FSM from semantic JSON..."):
+                            try:
+                                st.session_state.fsm_diagram = _generate_fsm_diagram(sj)
+                                st.success("✅ Done")
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+
+                    if regen_timing:
+                        with st.spinner("Regenerating Timing from semantic JSON..."):
+                            try:
+                                st.session_state.timing_diagram = _generate_timing_diagram(sj)
+                                st.success("✅ Done")
+                            except Exception as e:
+                                st.error(f"❌ {e}")
+
+                    st.divider()
+
+                    # Render Sequence
+                    if st.session_state.sequence_diagram and diagram_type in (
+                            "📨 Sequence Diagram", "🗂️ All Three"):
+                        st.markdown("### 📨 Sequence Diagram")
+                        v, s = st.tabs(["Rendered", "PlantUML Source"])
+                        with v:
+                            _render_plantuml(st.session_state.sequence_diagram, height=700)
+                        with s:
+                            st.code(st.session_state.sequence_diagram, language="text")
+                            _puml_download("💾 Download sequence.puml",
+                                           st.session_state.sequence_diagram, "sequence.puml")
+
+                    # Render FSM
+                    if st.session_state.fsm_diagram and diagram_type in (
+                            "🔁 Finite State Machine (FSM)", "🗂️ All Three"):
+                        st.markdown("### 🔁 Finite State Machine")
+                        v, s = st.tabs(["Rendered", "PlantUML Source"])
+                        with v:
+                            _render_plantuml(st.session_state.fsm_diagram, height=700)
+                        with s:
+                            st.code(st.session_state.fsm_diagram, language="text")
+                            _puml_download("💾 Download fsm.puml",
+                                           st.session_state.fsm_diagram, "fsm.puml")
+
+                    # Render Timing
+                    if st.session_state.timing_diagram and diagram_type in (
+                            "⏱️ Signal Timing Diagram", "🗂️ All Three"):
+                        st.markdown("### ⏱️ Signal Timing Diagram")
+                        v, s = st.tabs(["Rendered", "PlantUML Source"])
+                        with v:
+                            _render_plantuml(st.session_state.timing_diagram, height=600)
+                        with s:
+                            st.code(st.session_state.timing_diagram, language="text")
+                            _puml_download("💾 Download timing.puml",
+                                           st.session_state.timing_diagram, "timing.puml")
+
+                    if not any([st.session_state.sequence_diagram,
+                                st.session_state.fsm_diagram,
+                                st.session_state.timing_diagram]):
+                        st.info("👆 Select a diagram type and click **Generate Diagrams**.")
+
+                    st.divider()
+
+                    # Manual PlantUML editor
+                    with st.expander("✏️ Manual PlantUML Editor"):
+                        default = (st.session_state.sequence_diagram or
+                                   st.session_state.fsm_diagram or
+                                   st.session_state.timing_diagram or
+                                   "@startuml\nAlice -> Bob: Hello\nBob --> Alice: Hi\n@enduml")
+                        manual_code = st.text_area(
+                            "PlantUML Code", value=default,
+                            height=260, key="manual_puml_editor"
+                        )
+                        if st.button("🖼️ Render", key="render_custom"):
+                            _render_plantuml(manual_code, height=600)
+                            _puml_download("💾 Download custom.puml", manual_code, "custom.puml")
+
+        # ── Right column: Protocol Detection ────────────────────────────────
+        with col2:
+            st.subheader("Protocol Detection")
+
+            if not st.session_state.protocol_result:
+                with st.spinner("Detecting protocol..."):
+                    st.session_state.protocol_result = detect_protocol(md)
+
+            result = st.session_state.protocol_result
+            st.metric("Protocol",   result["protocol"])
+            st.metric("Confidence", result["confidence"])
+            st.write("**Signals Found**")
+            for sig in result["signals_found"]:
+                st.write(f"- {sig}")
+            st.write("**Reasoning**")
+            st.info(result["reasoning"])
+
+            if st.session_state.semantic_json:
+                st.divider()
+                st.subheader("🧠 Semantic Metrics")
+                sd = st.session_state.semantic_json
+                st.metric("Signals",      len(sd.get("signals",      [])))
+                st.metric("Transactions", len(sd.get("transactions", [])))
+                st.metric("Constraints",  len(sd.get("constraints",  [])))
+
+            if any([st.session_state.sequence_diagram,
+                    st.session_state.fsm_diagram,
+                    st.session_state.timing_diagram]):
+                st.divider()
+                st.subheader("📐 Diagram Status")
+                st.write("✅ Sequence" if st.session_state.sequence_diagram else "⬜ Sequence")
+                st.write("✅ FSM"      if st.session_state.fsm_diagram      else "⬜ FSM")
+                st.write("✅ Timing"   if st.session_state.timing_diagram   else "⬜ Timing")
+
+        # Cleanup temp file
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
