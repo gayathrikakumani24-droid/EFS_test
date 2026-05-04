@@ -1,0 +1,30 @@
+# LlamaParse + Qwen Vision Workflow Requirements
+
+# Core dependencies
+streamlit>=1.28.0          # Web interface
+llama-parse>=0.6.0         # PDF parsing with LlamaParse
+PyMuPDF>=1.23.0            # PDF image extraction (fitz)
+openai>=1.3.0              # OpenRouter API client
+python-dotenv>=1.0.0       # Environment variable management
+
+# Optional dependencies for enhanced functionality
+# Uncomment as needed:
+
+# For async processing (future enhancement)
+# asyncio-contextmanager>=1.0.0
+
+# For batch processing
+# tqdm>=4.65.0              # Progress bars
+
+# For data validation
+# pydantic>=2.0.0
+
+# For logging
+# loguru>=0.7.0
+
+# Development dependencies
+# Uncomment for development:
+# pytest>=7.4.0             # Testing
+# black>=23.0.0             # Code formatting
+# flake8>=6.0.0             # Linting
+# mypy>=1.5.0               # Type checking
